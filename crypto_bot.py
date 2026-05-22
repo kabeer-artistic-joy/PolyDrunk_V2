@@ -338,8 +338,18 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
         )
         client.set_api_creds(client.create_or_derive_api_creds())
 
-        taker_price = min(round(price + 0.01, 2), 0.99)  # multiple of 0.01, max 0.99
+        taker_price = min(round(price + 0.01, 4), 0.999)
         size        = round(amount_usdc / price, 2)
+
+        # CLOB v2 minimum is 5 shares per order
+        if size < 5:
+            min_cost = round(5 * price, 2)
+            if min_cost <= amount_usdc * 1.20:
+                log(f"   Adjusted size to minimum 5 shares (cost: ${min_cost:.2f} vs budget ${amount_usdc:.2f})")
+                size = 5.0
+            else:
+                log(f"   ❌ BUY skip: {size} shares below minimum 5, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
+                return False
 
         resp = client.create_and_post_order(OrderArgs(
             token_id=token_id,
@@ -349,6 +359,8 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
         ))
         log(f"   ✅ BUY OK: {resp.get('status')} | order {resp.get('orderID','')[:20]}...")
         return True
+    except ImportError:
+        raise ImportError("Install py-clob-client-v2: pip install py-clob-client-v2")
     except Exception as e:
         log(f"   ❌ BUY failed: {e}")
         return False
