@@ -323,11 +323,9 @@ def get_clob_price(token_id: str) -> float:
         return 0.0
 
 def execute_buy(token_id: str, amount_usdc: float, price: float,
-                private_key: str, proxy_wallet: str, signature_type: int = 0) -> bool:
+                private_key: str, proxy_wallet: str, signature_type: int = 2) -> bool:
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import ClobClient, OrderArgsV2, Side
 
         client = ClobClient(
             host=CLOB_API,
@@ -336,7 +334,7 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
             signature_type=signature_type,
             funder=proxy_wallet,
         )
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client.set_api_creds(client.create_or_derive_api_key())
 
         taker_price = min(round(price + 0.01, 4), 0.999)
         size        = round(amount_usdc / price, 2)
@@ -351,11 +349,11 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
                 log(f"   ❌ BUY skip: {size} shares below minimum 5, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
                 return False
 
-        resp = client.create_and_post_order(OrderArgs(
+        resp = client.create_and_post_order(OrderArgsV2(
             token_id=token_id,
             price=taker_price,
             size=size,
-            side=BUY,
+            side=Side.BUY,
         ))
         log(f"   ✅ BUY OK: {resp.get('status')} | order {resp.get('orderID','')[:20]}...")
         return True
@@ -376,7 +374,7 @@ class CryptoBot:
         self.trades       = []
         self.private_key  = os.getenv("POLY_PRIVATE_KEY", "")
         self.proxy_wallet = os.getenv("POLY_PROXY_WALLET", "")
-        self.signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+        self.signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
 
         if not paper and not dry_run and (not self.private_key or not self.proxy_wallet):
             raise ValueError("POLY_PRIVATE_KEY and POLY_PROXY_WALLET required in .env")
