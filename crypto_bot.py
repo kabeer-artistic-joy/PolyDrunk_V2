@@ -323,9 +323,10 @@ def get_clob_price(token_id: str) -> float:
         return 0.0
 
 def execute_buy(token_id: str, amount_usdc: float, price: float,
-                private_key: str, proxy_wallet: str, signature_type: int = 3) -> bool:
+                private_key: str, proxy_wallet: str, signature_type: int = 3) -> float:
+    """Returns actual USDC cost filled (0.0 if nothing filled or an error occurred)."""
     try:
-        from py_clob_client_v2 import ClobClient, OrderArgsV2, Side, AssetType, BalanceAllowanceParams
+        from py_clob_client_v2 import ClobClient, OrderArgsV2, Side, AssetType, BalanceAllowanceParams, OrderType
 
         client = ClobClient(
             host=CLOB_API,
@@ -343,8 +344,7 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
             signature_type=signature_type,
         ))
 
-        taker_price = min(round(price + 0.01, 4), 0.99)
-        size        = round(amount_usdc / price, 2)
+        size = round(amount_usdc / price, 2)
 
         # CLOB v2 minimum is 5 shares per order
         if size < 5:
@@ -354,21 +354,68 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
                 size = 5.0
             else:
                 log(f"   ❌ BUY skip: {size} shares below minimum 5, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
-                return False
+                return 0.0
 
-        resp = client.create_and_post_order(OrderArgsV2(
-            token_id=token_id,
-            price=taker_price,
-            size=size,
-            side=Side.BUY,
-        ))
-        log(f"   ✅ BUY OK: {resp.get('status')} | order {resp.get('orderID','')[:20]}...")
-        return True
+        # Walk the actual ask side to find a price that covers our full size,
+        # instead of guessing a flat +$0.01 buffer that may not reach deep enough.
+        taker_price = min(round(price + 0.01, 4), 0.99)  # fallback if book fetch fails
+        try:
+            book = client.get_order_book(token_id)
+            asks = sorted(
+                ((float(a["price"]), float(a["size"])) for a in book.get("asks", [])),
+                key=lambda x: x[0],
+            )
+            filled = 0.0
+            reach_price = price
+            for ask_price, ask_size in asks:
+                filled += ask_size
+                reach_price = ask_price
+                if filled >= size:
+                    break
+            taker_price = min(round(reach_price + 0.001, 4), 0.99)
+            log(f"   Book check: need {size} shares, {filled:.1f} available up to ${reach_price:.3f} "
+                f"→ taker_price=${taker_price:.3f}")
+        except Exception as e:
+            log(f"   Book fetch failed ({e}), using fallback price ${taker_price:.3f}")
+
+        resp = client.create_and_post_order(
+            OrderArgsV2(
+                token_id=token_id,
+                price=taker_price,
+                size=size,
+                side=Side.BUY,
+            ),
+            order_type=OrderType.FAK,
+        )
+        # Confirmed against Polymarket's order-lifecycle docs: statuses are
+        # live/matched/delayed/unmatched — only "matched" means funds moved.
+        status = str(resp.get("status", "")).lower()
+        if status != "matched":
+            log(f"   ❌ BUY not filled: status={status} | order {resp.get('orderID','')[:20]}...")
+            return 0.0
+
+        order_id = resp.get("orderID", "")
+
+        # Confirmed field for actual filled amount is `size_matched` on the
+        # order object itself (per docs.polymarket.com/trading/orders/overview),
+        # not the makingAmount/takingAmount echoed in the POST response.
+        try:
+            order_detail = client.get_order(order_id)
+            filled_size = round(float(order_detail["size_matched"]), 2)
+            filled_cost = round(filled_size * taker_price, 2)
+        except Exception as e:
+            log(f"   ⚠️ Could not fetch size_matched via get_order ({e}), assuming full fill.")
+            filled_size, filled_cost = size, round(size * taker_price, 2)
+
+        fill_pct = (filled_size / size * 100) if size else 0
+        log(f"   ✅ BUY OK: {status} | filled {filled_size:.2f}/{size:.2f} shares ({fill_pct:.0f}%) "
+            f"| cost ${filled_cost:.2f} | order {order_id[:20]}...")
+        return filled_cost
     except ImportError:
         raise ImportError("Install py-clob-client-v2: pip install py-clob-client-v2")
     except Exception as e:
         log(f"   ❌ BUY failed: {e}")
-        return False
+        return 0.0
 
 # ─── BOT ───────────────────────────────────────────────────────────────────────
 class CryptoBot:
@@ -554,27 +601,29 @@ class CryptoBot:
         if self.paper or self.dry_run:
             mode = "📄 PAPER" if self.paper else "🔍 DRY RUN"
             log(f"   {mode} — not executed on chain")
-            executed = True
+            filled_amount = self.amount
         else:
-            executed = execute_buy(
+            filled_amount = execute_buy(
                 market["winner_token"], self.amount, price,
                 self.private_key, self.proxy_wallet, self.signature_type
             )
 
-        if executed:
+        if filled_amount > 0:
+            actual_pnl = (filled_amount / price) - filled_amount
             self.trades.append({
                 "crypto":       crypto,
                 "title":        market["title"],
                 "side":         market["winner_side"],
                 "price_entry":  price,
-                "amount":       self.amount,
+                "amount":       filled_amount,
                 "seconds_left": seconds_left,
-                "pnl_expected": expected_pnl,
+                "pnl_expected": actual_pnl,
                 "delta_pct":    ta.get("delta_pct", 0),
                 "confidence":   ta.get("confidence", 0),
                 "timestamp":    ts_str(),
             })
-            log(f"   ✅ Trade #{len(self.trades)} recorded [{crypto}]")
+            fill_note = "" if filled_amount >= self.amount * 0.99 else f" (partial: ${filled_amount:.2f} of ${self.amount:.2f})"
+            log(f"   ✅ Trade #{len(self.trades)} recorded [{crypto}]{fill_note}")
 
     def _print_summary(self):
         log("─" * 60)
