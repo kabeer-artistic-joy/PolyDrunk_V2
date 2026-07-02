@@ -47,6 +47,9 @@ POLL_INTERVAL     = 3
 
 # Window Delta thresholds (current price vs period-open price)
 DELTA_SKIP        = 0.0006  # < 0.06% → too close to the line, skip
+                             # (raised from 0.05% after 32hr live data: this threshold
+                             #  would have avoided the only loss in 107 trades while
+                             #  keeping 68/68 winners at delta>=0.06%)
 DELTA_WEAK        = 0.001   # 0.05–0.10% → weak signal
 DELTA_STRONG      = 0.002   # > 0.20% → strong signal
 
@@ -238,6 +241,8 @@ def analyze(symbol: str, window_ts: int) -> dict:
     # 2. Micro momentum (last 2 1min candles)
     # Momentum only reinforces the delta — never reverses it
     candles = get_binance_candles(symbol, "1m", 3)
+    momentum_up = None
+    momentum_confirms = False
     if len(candles) >= 2:
         prev_close   = float(candles[-2][4])
         last_close   = float(candles[-1][4])
@@ -245,6 +250,7 @@ def analyze(symbol: str, window_ts: int) -> dict:
         # Only adds if momentum aligns with the delta direction
         if (delta > 0 and momentum_up) or (delta < 0 and not momentum_up):
             score += 2
+            momentum_confirms = True
             momentum_str = f"↑ {last_close:.2f} (confirms)" if momentum_up else f"↓ {last_close:.2f} (confirms)"
         else:
             momentum_str = f"{'↑' if momentum_up else '↓'} {last_close:.2f} (contradicts, ignored)"
@@ -256,15 +262,18 @@ def analyze(symbol: str, window_ts: int) -> dict:
     direction  = "Up" if score > 0 else "Down"
 
     return {
-        "score":         score,
-        "confidence":    confidence,
-        "direction":     direction,
-        "window_open":   window_open,
-        "current_price": current_price,
-        "delta_pct":     delta_pct,
-        "delta_weight":  delta_weight,
-        "momentum":      momentum_str,
-        "atr":           atr if 'atr' in locals() else 0,
+        "score":              score,
+        "confidence":         confidence,
+        "direction":          direction,
+        "window_open":        window_open,
+        "current_price":      current_price,
+        "delta_pct":          delta_pct,
+        "delta_weight":       delta_weight,
+        "momentum":           momentum_str,
+        "momentum_up":        momentum_up,        # raw bool/None — for cross-cycle stability tracking
+        "momentum_confirms":  momentum_confirms,   # whether it agreed with delta direction THIS cycle
+        "window_ts":          window_ts,
+        "atr":                atr if 'atr' in locals() else 0,
         "reason":        f"delta={delta_pct:.4f}% ({delta_dir}, w={delta_weight}) momentum={momentum_str}",
     }
 
@@ -425,6 +434,7 @@ class CryptoBot:
         self.dry_run      = dry_run  # real data, no execution
         self.amount       = amount
         self.traded_slugs = set()
+        self.momentum_track = {}  # {crypto: {"window_ts": int, "up": bool, "consecutive": int}}
         self.trades       = []
         self.private_key  = os.getenv("POLY_PRIVATE_KEY", "")
         self.proxy_wallet = os.getenv("POLY_PROXY_WALLET", "")
@@ -527,6 +537,20 @@ class CryptoBot:
                 if slug in self.traded_slugs or slug in entered_slugs:
                     continue
 
+                # Track how many consecutive polling cycles momentum has held
+                # the same direction, resetting whenever a new 5min window starts
+                # or momentum flips. Logged for later analysis — does not affect
+                # entry decisions (yet).
+                m_up   = ta.get("momentum_up")
+                w_ts   = ta.get("window_ts")
+                prev   = self.momentum_track.get(crypto)
+                if prev is None or prev["window_ts"] != w_ts or prev["up"] != m_up:
+                    consecutive = 1
+                else:
+                    consecutive = prev["consecutive"] + 1
+                self.momentum_track[crypto] = {"window_ts": w_ts, "up": m_up, "consecutive": consecutive}
+                ta["momentum_stable_cycles"] = consecutive
+
                 # Log monitoring info when still outside entry window
                 if seconds_left > ENTRY_SECONDS_MAX + 5:
                     log(f"   [{crypto}] {seconds_left:.0f}s | "
@@ -540,6 +564,7 @@ class CryptoBot:
                     f"PM:{market['winner_side']}@{market['winner_price']:.3f} | "
                     f"delta:{ta.get('delta_pct',0):.4f}% | "
                     f"conf:{ta.get('confidence',0):.0%} | "
+                    f"mom_stable:{consecutive}x | "
                     f"{ta.get('reason','')[:50]}")
 
                 if ENTRY_SECONDS_MIN <= seconds_left <= ENTRY_SECONDS_MAX:
@@ -596,7 +621,9 @@ class CryptoBot:
             f"invested=${self.amount:.2f} | expected_pnl=+${expected_pnl:.2f} (+{expected_pct:.1f}%)")
         log(f"   Price:{ta.get('current_price',0):.2f} | "
             f"delta:{ta.get('delta_pct',0):.4f}% | "
-            f"conf:{ta.get('confidence',0):.0%}")
+            f"conf:{ta.get('confidence',0):.0%} | "
+            f"momentum_confirms:{ta.get('momentum_confirms')} | "
+            f"momentum_stable_cycles:{ta.get('momentum_stable_cycles',0)}")
 
         if self.paper or self.dry_run:
             mode = "📄 PAPER" if self.paper else "🔍 DRY RUN"
