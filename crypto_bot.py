@@ -46,7 +46,7 @@ WAKE_BEFORE       = 65
 POLL_INTERVAL     = 3
 
 # Window Delta thresholds (current price vs period-open price)
-DELTA_SKIP        = 0.0005  # < 0.05% → too close to the line, skip
+DELTA_SKIP        = 0.0006  # < 0.06% → too close to the line, skip
 DELTA_WEAK        = 0.001   # 0.05–0.10% → weak signal
 DELTA_STRONG      = 0.002   # > 0.20% → strong signal
 
