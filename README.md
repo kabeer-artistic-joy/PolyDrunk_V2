@@ -42,7 +42,7 @@ The bot wakes up ~65 seconds before each market close and begins monitoring. It 
 | > 1.0% | 7 |
 | > 0.20% | 5 |
 | > 0.10% | 3 |
-| > 0.05% | 1 |
+| > 0.06% | 1 |
 | Momentum confirms | +2 |
 | **Max possible** | **9** |
 
