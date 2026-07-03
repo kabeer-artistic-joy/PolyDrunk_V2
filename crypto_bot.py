@@ -388,16 +388,17 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
 
         order_id = resp.get("orderID", "")
 
-        # Confirmed field for actual filled amount is `size_matched` on the
-        # order object itself (per docs.polymarket.com/trading/orders/overview),
-        # not the makingAmount/takingAmount echoed in the POST response.
+        # makingAmount/takingAmount are confirmed fields on this same POST /order
+        # response (clob-openapi.yaml SendOrderResponse) — 6-decimal fixed-point
+        # strings for USDC cost and shares received. We switched to reading these
+        # directly here instead of a separate get_order() lookup, since get_order
+        # returned None for this order type (market/FAK orders resolve instantly
+        # and likely never enter the "open orders" index get_order queries).
         try:
-            order_detail = client.get_order(order_id)
-            filled_size = round(float(order_detail["size_matched"]), 4)
-            fill_price  = round(float(order_detail.get("price", price)), 4)
-            filled_cost = round(filled_size * fill_price, 2)
-        except Exception as e:
-            log(f"   ⚠️ Could not fetch size_matched via get_order ({e}), assuming full fill.")
+            filled_cost = round(float(resp["makingAmount"]) / 1_000_000, 2)
+            filled_size = round(float(resp["takingAmount"]) / 1_000_000, 4)
+        except (KeyError, TypeError, ValueError) as e:
+            log(f"   ⚠️ Could not parse makingAmount/takingAmount ({e}), assuming full fill. Raw resp: {resp}")
             filled_size, filled_cost = amount_usdc / price, amount_usdc
 
         expected_size = amount_usdc / price
