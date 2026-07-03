@@ -335,7 +335,7 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
                 private_key: str, proxy_wallet: str, signature_type: int = 3) -> float:
     """Returns actual USDC cost filled (0.0 if nothing filled or an error occurred)."""
     try:
-        from py_clob_client_v2 import ClobClient, OrderArgsV2, Side, AssetType, BalanceAllowanceParams, OrderType
+        from py_clob_client_v2 import ClobClient, MarketOrderArgsV2, Side, AssetType, BalanceAllowanceParams, OrderType
 
         client = ClobClient(
             host=CLOB_API,
@@ -353,45 +353,28 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
             signature_type=signature_type,
         ))
 
-        size = round(amount_usdc / price, 2)
-
-        # CLOB v2 minimum is 5 shares per order
-        if size < 5:
+        # Minimum order is 5 shares; use the entry price as a rough check
+        # before asking the SDK to size the actual order (it re-derives the
+        # real marketable price itself via calculate_market_price).
+        if amount_usdc / price < 5:
             min_cost = round(5 * price, 2)
             if min_cost <= amount_usdc * 1.20:
-                log(f"   Adjusted size to minimum 5 shares (cost: ${min_cost:.2f} vs budget ${amount_usdc:.2f})")
-                size = 5.0
+                log(f"   Adjusted budget to cover minimum 5 shares (cost: ${min_cost:.2f} vs budget ${amount_usdc:.2f})")
+                amount_usdc = min_cost
             else:
-                log(f"   ❌ BUY skip: {size} shares below minimum 5, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
+                log(f"   ❌ BUY skip: below minimum 5 shares, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
                 return 0.0
 
-        # Walk the actual ask side to find a price that covers our full size,
-        # instead of guessing a flat +$0.01 buffer that may not reach deep enough.
-        taker_price = min(round(price + 0.01, 4), 0.99)  # fallback if book fetch fails
-        try:
-            book = client.get_order_book(token_id)
-            asks = sorted(
-                ((float(a["price"]), float(a["size"])) for a in book.get("asks", [])),
-                key=lambda x: x[0],
-            )
-            filled = 0.0
-            reach_price = price
-            for ask_price, ask_size in asks:
-                filled += ask_size
-                reach_price = ask_price
-                if filled >= size:
-                    break
-            taker_price = min(round(reach_price + 0.001, 4), 0.99)
-            log(f"   Book check: need {size} shares, {filled:.1f} available up to ${reach_price:.3f} "
-                f"→ taker_price=${taker_price:.3f}")
-        except Exception as e:
-            log(f"   Book fetch failed ({e}), using fallback price ${taker_price:.3f}")
-
-        resp = client.create_and_post_order(
-            OrderArgsV2(
+        # Use the SDK's own market-order path (create_market_order /
+        # calculate_market_price) instead of hand-rolling book-walking and
+        # size/price arithmetic ourselves — that hand-rolled version produced
+        # a maker-amount precision bug (price × size landing on >2 decimals,
+        # rejected by the exchange). The SDK's own order-builder handles the
+        # tick-size and precision rules directly.
+        resp = client.create_and_post_market_order(
+            MarketOrderArgsV2(
                 token_id=token_id,
-                price=taker_price,
-                size=size,
+                amount=amount_usdc,
                 side=Side.BUY,
             ),
             order_type=OrderType.FAK,
@@ -410,14 +393,16 @@ def execute_buy(token_id: str, amount_usdc: float, price: float,
         # not the makingAmount/takingAmount echoed in the POST response.
         try:
             order_detail = client.get_order(order_id)
-            filled_size = round(float(order_detail["size_matched"]), 2)
-            filled_cost = round(filled_size * taker_price, 2)
+            filled_size = round(float(order_detail["size_matched"]), 4)
+            fill_price  = round(float(order_detail.get("price", price)), 4)
+            filled_cost = round(filled_size * fill_price, 2)
         except Exception as e:
             log(f"   ⚠️ Could not fetch size_matched via get_order ({e}), assuming full fill.")
-            filled_size, filled_cost = size, round(size * taker_price, 2)
+            filled_size, filled_cost = amount_usdc / price, amount_usdc
 
-        fill_pct = (filled_size / size * 100) if size else 0
-        log(f"   ✅ BUY OK: {status} | filled {filled_size:.2f}/{size:.2f} shares ({fill_pct:.0f}%) "
+        expected_size = amount_usdc / price
+        fill_pct = (filled_size / expected_size * 100) if expected_size else 0
+        log(f"   ✅ BUY OK: {status} | filled {filled_size:.2f}/{expected_size:.2f} shares ({fill_pct:.0f}%) "
             f"| cost ${filled_cost:.2f} | order {order_id[:20]}...")
         return filled_cost
     except ImportError:
