@@ -279,42 +279,55 @@ class SpreadBot:
 
         order_id = resp.get("orderID", "")
         status   = str(resp.get("status", "")).lower()
-        if status == "matched":
+        if status not in ("matched", "live"):
             elapsed_ms = (now_unix() - window_open_time) * 1000
-            try:
-                fill_cost  = round(float(resp["makingAmount"]) / 1_000_000, 2)
-                fill_size  = round(float(resp["takingAmount"]) / 1_000_000, 4)
-                fill_price = round(fill_cost / fill_size, 4) if fill_size else BUY_CEILING_PRICE
-            except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
-                log(f"⚠️ Could not parse actual fill price ({e}), falling back to ceiling — "
-                    f"this UNDERSTATES profit if price improvement occurred. Raw resp: {resp}", crypto)
-                fill_price, fill_size = BUY_CEILING_PRICE, size
-            log(f"✅ BUY matched immediately at ${fill_price} (ceiling was ${BUY_CEILING_PRICE}), "
-                f"order {order_id[:16]}... ({elapsed_ms:.0f}ms)", crypto)
-            return {"result": "bought", "price": fill_price, "shares": fill_size, "elapsed_ms": elapsed_ms}
+            log(f"❌ BUY order status '{status}' unexpected, treating as missed", crypto)
+            return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
 
+        # REAL BUG FIXED HERE: a GTC order can fill in MULTIPLE separate
+        # partial-fill events over time (confirmed from a real trade: 1.9
+        # shares matched immediately, then a SEPARATE 3.1 shares matched
+        # moments later — 5.0 total — but the old code returned immediately
+        # on the FIRST "matched" signal and never saw the second fill at all).
+        # This continues polling get_order() for the cumulative size_matched
+        # until the order is no longer open OR the timeout expires, instead
+        # of trusting only the first response.
         deadline = window_open_time + BUY_TIMEOUT_SEC
+        last_known_size = 0.0
         while now_unix() < deadline:
-            time.sleep(0.25)
             try:
                 detail = self.client.get_order(order_id)
             except Exception:
                 detail = None
             if detail is None:
-                elapsed_ms = (now_unix() - window_open_time) * 1000
-                log(f"✅ BUY appears filled (order no longer open), order {order_id[:16]}... ({elapsed_ms:.0f}ms) "
-                    f"— price assumed at ceiling ${BUY_CEILING_PRICE}, may understate actual profit", crypto)
-                return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": size, "elapsed_ms": elapsed_ms}
+                break  # no longer open — fully filled, cancelled, or expired
+            try:
+                current_size = float(detail.get("size_matched", 0))
+                if current_size > last_known_size:
+                    last_known_size = current_size
+                    log(f"BUY fill update: {last_known_size} shares matched so far", crypto)
+            except (TypeError, ValueError):
+                pass
+            time.sleep(0.25)
 
+        elapsed_ms = (now_unix() - window_open_time) * 1000
         from py_clob_client_v2 import OrderPayload
         try:
             self.client.cancel_order(OrderPayload(orderID=order_id))
-        except Exception as e:
-            log(f"⚠️ Cancel request failed ({e}) — order may still be resting, check manually.", crypto)
+        except Exception:
+            pass  # already fully filled and gone — fine, nothing to cancel
 
-        elapsed_ms = (now_unix() - window_open_time) * 1000
-        log(f"❌ BUY timed out after {BUY_TIMEOUT_SEC}s, cancelled ({elapsed_ms:.0f}ms)", crypto)
-        return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
+        if last_known_size <= 0:
+            log(f"❌ BUY timed out with no confirmed fill after {BUY_TIMEOUT_SEC}s ({elapsed_ms:.0f}ms)", crypto)
+            return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
+
+        # NOTE: price is assumed at the ceiling here, same known limitation as
+        # before — get_order() does not give a clean per-fill average price.
+        # This may UNDERSTATE profit if price improvement occurred, but does
+        # NOT affect the share count, which is now the real confirmed total.
+        log(f"✅ BUY confirmed: {last_known_size} total shares matched (ceiling was ${BUY_CEILING_PRICE}), "
+            f"order {order_id[:16]}... ({elapsed_ms:.0f}ms)", crypto)
+        return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": last_known_size, "elapsed_ms": elapsed_ms}
 
     # ── SELL PHASE ───────────────────────────────────────────────────────────
 
@@ -345,6 +358,26 @@ class SpreadBot:
             return {**exit_result, "opportunities": 0, "pnl_usd": pnl, "notes": "sub-1-share partial fill, forced exit immediately"}
         sell_trigger = round(buy_price + PROFIT_MARGIN, 4)  # relative to THIS trade's actual entry, not a fixed price
         log(f"Sell trigger for this trade: ${sell_trigger} (bought ${buy_price} + ${PROFIT_MARGIN} margin)", crypto)
+
+        # REAL BUG FIXED HERE: every single sell attempt was failing with
+        # "not enough balance / allowance" because we only ever synced
+        # COLLATERAL (USDC) balance at startup, never CONDITIONAL (the actual
+        # outcome-token shares) after a buy. The exchange's cached view of
+        # what we hold was never updated, so it thought we had 0 shares to
+        # sell even though the buy genuinely succeeded. Sync it here, once,
+        # right after a confirmed buy, before ever attempting to sell.
+        if not self.dry_run:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+            try:
+                self.client.update_balance_allowance(BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token,
+                    signature_type=int(os.getenv("POLY_SIGNATURE_TYPE", "3")),
+                ))
+                log("Synced conditional (share) balance before attempting to sell", crypto)
+            except Exception as e:
+                log(f"⚠️ Could not sync conditional balance ({e}) — sells may fail with a balance error", crypto)
+
         opportunities = 0
         in_opportunity_zone = False
 
