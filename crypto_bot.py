@@ -1,285 +1,92 @@
+#!/usr/bin/env python3
 """
-crypto_bot.py — ETH/BTC Up/Down 5min Trading Bot with Window Delta
-Strategy:
-  - Calculates Window Delta (current ETH price vs period-open price) from Binance
-  - Only enters if the delta is large enough (near-certain outcome)
-  - Enters between 10–50 seconds before close when Polymarket price >= 0.92
+Polymarket Up-Only Scalper Bot
+====================================
+Buys UP unconditionally at the instant every 5-minute window opens — no
+delta, no momentum, no magnitude check, no observation period. Just:
 
-Improvements over previous version:
-  - Binance Window Delta as primary filter (avoids entering near the line)
-  - Micro momentum (direction of last 2 1min candles)
-  - Composite score → configurable minimum confidence
-  - Dry run mode (real data, no trades executed)
+    Buy UP as cheaply as possible (target 50c, ceiling 52c) within 2
+    seconds of window open. Sell as soon as the price reaches 55c. If that
+    never happens, exit for whatever is available in the closing seconds
+    rather than hold to resolution.
+
+This is a SPREAD/VOLATILITY play, not a directional one — it does not care
+which side (Up or Down) ultimately wins. It only cares whether the UP price
+touches 55c at some point during the window before you're forced to exit.
+
+IMPORTANT — read before running live:
+  A loss in this bot is NOT bounded the way a directionally-confirmed entry
+  would be. If UP never reaches 55c during the window, this bot force-exits
+  in the final FORCE_EXIT_SECONDS at whatever price is available — which
+  could be far below your buy price. A single bad window can cost close to
+  your full stake. Run --dry-run for a meaningful sample before --live.
+
+Modes:
+  --dry-run   No real orders. Polls the REAL, LIVE order book throughout each
+              window and computes what WOULD have happened using real market
+              depth data — not simulated or assumed prices.
+  --live      Places real limit orders per the exact logic below, using your
+              Polymarket deposit wallet.
 
 Usage:
-    python crypto_bot.py --paper
-    python crypto_bot.py --live
-    python crypto_bot.py --dry-run      # real data, no trades
-    python crypto_bot.py --live --amount 10
+  python spread_bot.py --dry-run
+  python spread_bot.py --live --amount 2
 """
 
 import time
 import json
+import csv
 import argparse
+import threading
+import os
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 
 load_dotenv()
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-GAMMA_API         = "https://gamma-api.polymarket.com"
-CLOB_API          = "https://clob.polymarket.com"
-BINANCE_API       = "https://api.binance.com"
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-ENTRY_SECONDS_MAX = 50
-ENTRY_SECONDS_MIN = 10
-PRICE_MIN         = {          # minimum price per crypto — BTC stricter due to higher volatility
-    "BTC": 0.94,
-    "ETH": 0.92,
-}
-PRICE_MAX         = 0.99   # maximum price — CLOB accepts up to 0.99
-
-WAKE_BEFORE       = 65
-POLL_INTERVAL     = 3
-
-# Window Delta thresholds (current price vs period-open price)
-DELTA_SKIP        = 0.0006  # < 0.06% → too close to the line, skip
-                             # (raised from 0.05% after 32hr live data: this threshold
-                             #  would have avoided the only loss in 107 trades while
-                             #  keeping 68/68 winners at delta>=0.06%)
-DELTA_WEAK        = 0.001   # 0.05–0.10% → weak signal
-DELTA_STRONG      = 0.002   # > 0.20% → strong signal
-
-# Minimum confidence to enter (0.0 – 1.0)
-MIN_CONFIDENCE    = 0.3
-
-# ATR — volatility filter
-ATR_PERIODS       = 5     # last 5 periods of 5min
-ATR_MULTIPLIER    = 1.5   # if current range > 1.5x ATR → skip
-
-# Binance symbols
-BINANCE_SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-}
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 
 MARKETS = {
     "btc-updown-5m": "BTC",
     "eth-updown-5m": "ETH",
 }
 
-# ─── UTILS ─────────────────────────────────────────────────────────────────────
+BUY_TARGET_PRICE   = 0.50   # what we hope to pay
+BUY_CEILING_PRICE  = 0.54   # max we're willing to pay — this is the actual limit price used
+BUY_TIMEOUT_SEC    = 3.0    # cancel the buy attempt if unfilled after this long
+
+PROFIT_MARGIN      = 0.05   # sell as soon as (current bid) >= (actual buy price) + this margin.
+                              # Relative to YOUR entry, not a fixed absolute price — if you buy at
+                              # 0.47, the trigger is 0.52; if you buy at 0.52, the trigger is 0.57.
+                              # Same profit either way, since it's measured from where you actually got in.
+
+FORCE_EXIT_SECONDS_LEFT = 60  # in the final N seconds of the window, exit at any price if still holding
+
+POLL_INTERVAL_FAST = 0.05   # tight poll interval used right at window open (seconds)
+POLL_INTERVAL_SLOW = 1.0    # normal poll interval while watching for a sell opportunity
+
+# ─── UTILITIES ───────────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
 def ts_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def log(msg):
-    print(f"[{ts_str()}] {msg}")
+def log(msg, crypto=""):
+    prefix = f"[{crypto}] " if crypto else ""
+    with _print_lock:
+        print(f"[{ts_str()}] {prefix}{msg}", flush=True)
 
 def now_unix():
-    return int(time.time())
+    return time.time()
 
-def next_close_ts():
-    return ((now_unix() // 300) + 1) * 300
 
-def window_open_ts():
-    """Timestamp of the current period's open (multiple of 300)."""
-    return (now_unix() // 300) * 300
-
-# ─── BINANCE API ───────────────────────────────────────────────────────────────
-def get_binance_candles(symbol: str, interval: str = "1m", limit: int = 6) -> list:
-    """Fetches the last N candles from Binance."""
-    try:
-        r = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=3
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log(f"[BINANCE ERROR] {e}")
-        return []
-
-def get_binance_price(symbol: str) -> float:
-    """Current price from Binance."""
-    try:
-        r = requests.get(
-            f"{BINANCE_API}/api/v3/ticker/price",
-            params={"symbol": symbol},
-            timeout=2
-        )
-        r.raise_for_status()
-        return float(r.json()["price"])
-    except Exception:
-        return 0.0
-
-def get_window_open_price(symbol: str, window_ts: int) -> float:
-    """
-    Fetches the open price of the current period from Binance.
-    window_ts is the Unix timestamp of the 5-minute period start.
-    """
-    try:
-        # Fetch the 5min candle corresponding to the period start
-        r = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
-            params={
-                "symbol":    symbol,
-                "interval":  "5m",
-                "startTime": window_ts * 1000,  # Binance uses milliseconds
-                "limit":     1,
-            },
-            timeout=3
-        )
-        r.raise_for_status()
-        candles = r.json()
-        if candles:
-            return float(candles[0][1])  # open price
-        return 0.0
-    except Exception:
-        return 0.0
-
-# ─── TECHNICAL ANALYSIS ────────────────────────────────────────────────────────
-
-def get_atr(symbol: str, window_ts: int, periods: int = 5) -> float:
-    """
-    Calculates ATR (Average True Range) over the last N 5min periods.
-    Returns the average range in USDC.
-    """
-    try:
-        # Fetch periods candles ending at the current period start
-        r = requests.get(
-            f"{BINANCE_API}/api/v3/klines",
-            params={
-                "symbol":   symbol,
-                "interval": "5m",
-                "endTime":  window_ts * 1000,  # up to the current period start
-                "limit":    periods,
-            },
-            timeout=3
-        )
-        r.raise_for_status()
-        candles = r.json()
-        if not candles:
-            return 0.0
-        ranges = [float(c[2]) - float(c[3]) for c in candles]  # high - low
-        return sum(ranges) / len(ranges)
-    except Exception:
-        return 0.0
-
-def analyze(symbol: str, window_ts: int) -> dict:
-    """
-    Calculates a composite score based on:
-    1. Window Delta (weight 5–7) — difference between current price and period open
-    2. Micro momentum (weight 2) — direction of last 2 1min candles
-
-    Returns: {score, confidence, direction, window_open, current_price, delta_pct, reason}
-    """
-    # Current price
-    current_price = get_binance_price(symbol)
-    if current_price <= 0:
-        return {"confidence": 0, "direction": None, "reason": "no Binance price"}
-
-    # Period open price
-    window_open = get_window_open_price(symbol, window_ts)
-    if window_open <= 0:
-        # Fallback: use the open of the first 1min candle in the period
-        candles = get_binance_candles(symbol, "1m", 6)
-        if candles:
-            window_open = float(candles[0][1])
-        else:
-            return {"confidence": 0, "direction": None, "reason": "no open price"}
-
-    # 1. Window Delta
-    delta = (current_price - window_open) / window_open
-    delta_pct = abs(delta) * 100
-    delta_dir = "Up" if delta > 0 else "Down"
-
-    # ATR — volatility filter
-    # If the current period range already exceeds 1.5x historical ATR → too volatile
-    atr = get_atr(symbol, window_ts, ATR_PERIODS)
-    if atr > 0:
-        candles_5m = get_binance_candles(symbol, "5m", 1)
-        if candles_5m:
-            current_range = float(candles_5m[0][2]) - float(candles_5m[0][3])  # high - low
-            if current_range > atr * ATR_MULTIPLIER:
-                return {
-                    "confidence":    0,
-                    "direction":     None,
-                    "window_open":   window_open,
-                    "current_price": current_price,
-                    "delta_pct":     delta_pct,
-                    "atr":           atr,
-                    "current_range": current_range,
-                    "reason":        f"ATR skip: range ${current_range:.2f} > {ATR_MULTIPLIER}x ATR ${atr:.2f}",
-                }
-
-    if abs(delta) < DELTA_SKIP:
-        return {
-            "confidence":    0,
-            "direction":     None,
-            "window_open":   window_open,
-            "current_price": current_price,
-            "delta_pct":     delta_pct,
-            "reason":        f"delta {delta_pct:.4f}% < {DELTA_SKIP*100:.3f}% — too close to the line",
-        }
-
-    # Delta weight
-    if abs(delta) >= DELTA_STRONG * 5:  # > 1%
-        delta_weight = 7
-    elif abs(delta) >= DELTA_STRONG:    # > 0.2%
-        delta_weight = 5
-    elif abs(delta) >= DELTA_WEAK:      # > 0.1%
-        delta_weight = 3
-    else:                                # > 0.05%
-        delta_weight = 1
-
-    score = delta_weight if delta > 0 else -delta_weight
-
-    # 2. Micro momentum (last 2 1min candles)
-    # Momentum only reinforces the delta — never reverses it
-    candles = get_binance_candles(symbol, "1m", 3)
-    momentum_up = None
-    momentum_confirms = False
-    if len(candles) >= 2:
-        prev_close   = float(candles[-2][4])
-        last_close   = float(candles[-1][4])
-        momentum_up  = last_close > prev_close
-        # Only adds if momentum aligns with the delta direction
-        if (delta > 0 and momentum_up) or (delta < 0 and not momentum_up):
-            score += 2
-            momentum_confirms = True
-            momentum_str = f"↑ {last_close:.2f} (confirms)" if momentum_up else f"↓ {last_close:.2f} (confirms)"
-        else:
-            momentum_str = f"{'↑' if momentum_up else '↓'} {last_close:.2f} (contradicts, ignored)"
-    else:
-        momentum_str = "no data"
-
-    # Confidence (normalized over 9 = max possible)
-    confidence = min(abs(score) / 9.0, 1.0)
-    direction  = "Up" if score > 0 else "Down"
-
-    return {
-        "score":              score,
-        "confidence":         confidence,
-        "direction":          direction,
-        "window_open":        window_open,
-        "current_price":      current_price,
-        "delta_pct":          delta_pct,
-        "delta_weight":       delta_weight,
-        "momentum":           momentum_str,
-        "momentum_up":        momentum_up,        # raw bool/None — for cross-cycle stability tracking
-        "momentum_confirms":  momentum_confirms,   # whether it agreed with delta direction THIS cycle
-        "window_ts":          window_ts,
-        "atr":                atr if 'atr' in locals() else 0,
-        "reason":        f"delta={delta_pct:.4f}% ({delta_dir}, w={delta_weight}) momentum={momentum_str}",
-    }
-
-# ─── POLYMARKET API ────────────────────────────────────────────────────────────
-def get_market_for_close(slug_prefix: str, close_ts: int) -> dict | None:
-    start_ts = close_ts - 300
+def get_window_market(slug_prefix: str, start_ts: int) -> dict | None:
+    """Find the Up/Down market for a window starting at start_ts."""
     slug = f"{slug_prefix}-{start_ts}"
     try:
         r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=3)
@@ -291,381 +98,446 @@ def get_market_for_close(slug_prefix: str, close_ts: int) -> dict | None:
     except Exception:
         return None
 
-    if not event.get("active") or event.get("closed"):
-        return None
-
     markets = event.get("markets", [])
     if not markets:
         return None
-
     market = markets[0]
-    outcome_prices = json.loads(market.get("outcomePrices", "[]"))
-    outcomes       = json.loads(market.get("outcomes", "[]"))
-    clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
 
-    if len(outcome_prices) < 2 or len(clob_token_ids) < 2:
+    try:
+        outcomes       = json.loads(market.get("outcomes", "[]"))
+        clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+    except Exception:
         return None
 
-    prices = [float(p) for p in outcome_prices]
-    winner_idx = 0 if prices[0] >= prices[1] else 1
+    if len(outcomes) < 2 or len(clob_token_ids) < 2:
+        return None
+
+    tokens = dict(zip(outcomes, clob_token_ids))
+    if "Down" not in tokens or "Up" not in tokens:
+        return None
 
     return {
         "slug":         slug,
-        "slug_prefix":  slug_prefix,
         "crypto":       MARKETS[slug_prefix],
-        "title":        event.get("title", ""),
-        "close_ts":     close_ts,
-        "winner_side":  outcomes[winner_idx],
-        "winner_price": prices[winner_idx],
-        "winner_token": clob_token_ids[winner_idx],
-        "loser_price":  prices[1 - winner_idx],
+        "start_ts":     start_ts,
+        "close_ts":     start_ts + 300,
+        "down_token":   tokens["Down"],
+        "up_token":     tokens["Up"],
         "condition_id": market.get("conditionId", ""),
-        "liquidity":    float(event.get("liquidity", 0)),
+        "title":        event.get("title", ""),
     }
 
-def get_clob_price(token_id: str) -> float:
+
+def get_order_book(token_id: str) -> dict:
+    """Raw public order book fetch — no auth required."""
     try:
-        r = requests.get(f"{CLOB_API}/midpoint", params={"token_id": token_id}, timeout=2)
+        r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=2)
         r.raise_for_status()
-        return float(r.json().get("mid", 0))
+        return r.json()
     except Exception:
-        return 0.0
+        return {}
 
-def execute_buy(token_id: str, amount_usdc: float, price: float,
-                private_key: str, proxy_wallet: str, signature_type: int = 3) -> float:
-    """Returns actual USDC cost filled (0.0 if nothing filled or an error occurred)."""
-    try:
-        from py_clob_client_v2 import ClobClient, MarketOrderArgsV2, Side, AssetType, BalanceAllowanceParams, OrderType
 
-        client = ClobClient(
+def best_ask(book: dict):
+    """Returns (price, size) of the cheapest ask, or (None, None)."""
+    asks = book.get("asks", [])
+    if not asks:
+        return None, None
+    cheapest = min(asks, key=lambda a: float(a["price"]))
+    return float(cheapest["price"]), float(cheapest["size"])
+
+
+def best_bid(book: dict):
+    """Returns (price, size) of the highest bid, or (None, None)."""
+    bids = book.get("bids", [])
+    if not bids:
+        return None, None
+    highest = max(bids, key=lambda b: float(b["price"]))
+    return float(highest["price"]), float(highest["size"])
+
+
+def next_window_start(now: float) -> int:
+    """Returns the unix timestamp of the next 5-minute boundary."""
+    return int((now // 300) + 1) * 300
+
+
+# ─── PERSISTENT CSV LOG ──────────────────────────────────────────────────────
+
+CSV_FIELDS = [
+    "timestamp", "bot_name", "mode", "crypto", "slug",
+    "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
+    "num_opportunities", "sell_result", "sell_price",
+    "pnl_usd", "notes",
+]
+
+class TradeLogger:
+    def __init__(self, bot_name: str):
+        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades_log.csv")
+        self.lock = threading.Lock()
+        self.bot_name = bot_name
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(CSV_FIELDS)
+
+    def write(self, row: dict):
+        row = {**{k: "" for k in CSV_FIELDS}, **row}
+        with self.lock:
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([row[k] for k in CSV_FIELDS])
+
+
+# ─── CORE BOT ────────────────────────────────────────────────────────────────
+
+class SpreadBot:
+    def __init__(self, dry_run: bool, amount: float):
+        self.dry_run  = dry_run
+        self.amount   = amount
+        self.bot_name = os.getenv("BOT_NAME", "spread_bot")
+        self.mode_str = "dry_run" if dry_run else "live"
+        self.stop_event = threading.Event()
+        self.trades = []
+        self.trades_lock = threading.Lock()
+        self.logger = TradeLogger(self.bot_name)
+
+        self.client = None
+        if not dry_run:
+            self._init_client()
+
+        log("=" * 70)
+        log(f"Up-Only Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
+        log(f"Buy: target ${BUY_TARGET_PRICE} ceiling ${BUY_CEILING_PRICE} timeout {BUY_TIMEOUT_SEC}s")
+        log(f"Sell trigger: entry price + ${PROFIT_MARGIN} margin | force-exit last {FORCE_EXIT_SECONDS_LEFT}s")
+        log(f"Trade log: {self.logger.path}")
+        log("=" * 70)
+
+    def _init_client(self):
+        from py_clob_client_v2 import ClobClient, AssetType, BalanceAllowanceParams
+        signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "3"))
+        self.client = ClobClient(
             host=CLOB_API,
-            key=private_key,
+            key=os.environ["POLY_PRIVATE_KEY"],
             chain_id=137,
             signature_type=signature_type,
-            funder=proxy_wallet,
+            funder=os.environ["POLY_PROXY_WALLET"],
         )
-        client.set_api_creds(client.create_or_derive_api_key())
-
-        # Required for deposit wallet (POLY_1271) orders — syncs the CLOB's
-        # cached balance/allowance view with the deposit wallet's on-chain state.
-        client.update_balance_allowance(BalanceAllowanceParams(
+        self.client.set_api_creds(self.client.create_or_derive_api_key())
+        self.client.update_balance_allowance(BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
             signature_type=signature_type,
         ))
 
-        # Minimum order is 5 shares; use the entry price as a rough check
-        # before asking the SDK to size the actual order (it re-derives the
-        # real marketable price itself via calculate_market_price).
-        if amount_usdc / price < 5:
-            min_cost = round(5 * price, 2)
-            if min_cost <= amount_usdc * 1.20:
-                log(f"   Adjusted budget to cover minimum 5 shares (cost: ${min_cost:.2f} vs budget ${amount_usdc:.2f})")
-                amount_usdc = min_cost
-            else:
-                log(f"   ❌ BUY skip: below minimum 5 shares, would cost ${min_cost:.2f} vs budget ${amount_usdc:.2f}")
-                return 0.0
+    # ── BUY PHASE ────────────────────────────────────────────────────────────
 
-        # Use the SDK's own market-order path (create_market_order /
-        # calculate_market_price) instead of hand-rolling book-walking and
-        # size/price arithmetic ourselves — that hand-rolled version produced
-        # a maker-amount precision bug (price × size landing on >2 decimals,
-        # rejected by the exchange). The SDK's own order-builder handles the
-        # tick-size and precision rules directly.
-        resp = client.create_and_post_market_order(
-            MarketOrderArgsV2(
-                token_id=token_id,
-                amount=amount_usdc,
-                side=Side.BUY,
-            ),
-            order_type=OrderType.FAK,
-        )
-        # Confirmed against Polymarket's order-lifecycle docs: statuses are
-        # live/matched/delayed/unmatched — only "matched" means funds moved.
-        status = str(resp.get("status", "")).lower()
-        if status != "matched":
-            log(f"   ❌ BUY not filled: status={status} | order {resp.get('orderID','')[:20]}...")
-            return 0.0
+    def _attempt_buy(self, market: dict, window_open_time: float) -> dict:
+        """Attempt to buy UP at up to BUY_CEILING_PRICE within BUY_TIMEOUT_SEC of window open."""
+        crypto = market["crypto"]
+        token  = market["up_token"]
+
+        if self.dry_run:
+            deadline = window_open_time + BUY_TIMEOUT_SEC
+            last_seen_price = None
+            while now_unix() < deadline:
+                book = get_order_book(token)
+                price, size = best_ask(book)
+                if price is not None:
+                    last_seen_price = price
+                elapsed_ms = (now_unix() - window_open_time) * 1000
+                if price is not None and price <= BUY_CEILING_PRICE:
+                    MIN_SHARES = 1
+                    shares = max(MIN_SHARES, round(self.amount / price))
+                    actual_cost = round(shares * price, 2)
+                    if actual_cost > self.amount * 1.5:
+                        log(f"[DRY] Would need ~${actual_cost:.2f} to meet {MIN_SHARES}-share minimum at this price "
+                            f"— above ${self.amount:.2f} stake, would skip in live mode", crypto)
+                        return {"result": "skipped_min_size", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
+                    log(f"[DRY] BUY would fill: ask ${price:.3f} (size {size}) at {elapsed_ms:.0f}ms", crypto)
+                    return {"result": "bought", "price": price, "shares": shares, "elapsed_ms": elapsed_ms}
+                time.sleep(POLL_INTERVAL_FAST)
+            elapsed_ms = (now_unix() - window_open_time) * 1000
+            price_info = f"last real ask seen was ${last_seen_price:.3f}" if last_seen_price is not None else "no asks seen at all"
+            log(f"[DRY] BUY missed: no ask <= ${BUY_CEILING_PRICE} within {BUY_TIMEOUT_SEC}s ({price_info}) "
+                f"(waited {elapsed_ms:.0f}ms)", crypto)
+            return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
+
+        # LIVE
+        from py_clob_client_v2 import OrderArgsV2, Side, OrderType
+        MIN_SHARES = 1  # NOT independently confirmed by Polymarket docs — a minimal safety floor only.
+        size = max(MIN_SHARES, round(self.amount / BUY_CEILING_PRICE))
+        actual_cost = round(size * BUY_CEILING_PRICE, 2)
+        if actual_cost > self.amount * 1.5:
+            log(f"⚠️ To meet the {MIN_SHARES}-share minimum, this order needs ~${actual_cost:.2f}, "
+                f"well above your ${self.amount:.2f} stake — skipping this window.", crypto)
+            return {"result": "skipped_min_size", "price": None, "shares": 0, "elapsed_ms": 0}
+        try:
+            resp = self.client.create_and_post_order(
+                OrderArgsV2(token_id=token, price=BUY_CEILING_PRICE, size=size, side=Side.BUY),
+                order_type=OrderType.GTC,
+            )
+        except Exception as e:
+            log(f"❌ BUY order failed to submit: {e}", crypto)
+            return {"result": "error", "price": None, "shares": 0, "elapsed_ms": 0}
 
         order_id = resp.get("orderID", "")
+        status   = str(resp.get("status", "")).lower()
+        if status == "matched":
+            elapsed_ms = (now_unix() - window_open_time) * 1000
+            try:
+                fill_cost  = round(float(resp["makingAmount"]) / 1_000_000, 2)
+                fill_size  = round(float(resp["takingAmount"]) / 1_000_000, 4)
+                fill_price = round(fill_cost / fill_size, 4) if fill_size else BUY_CEILING_PRICE
+            except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+                log(f"⚠️ Could not parse actual fill price ({e}), falling back to ceiling — "
+                    f"this UNDERSTATES profit if price improvement occurred. Raw resp: {resp}", crypto)
+                fill_price, fill_size = BUY_CEILING_PRICE, size
+            log(f"✅ BUY matched immediately at ${fill_price} (ceiling was ${BUY_CEILING_PRICE}), "
+                f"order {order_id[:16]}... ({elapsed_ms:.0f}ms)", crypto)
+            return {"result": "bought", "price": fill_price, "shares": fill_size, "elapsed_ms": elapsed_ms}
 
-        # makingAmount/takingAmount are confirmed fields on this same POST /order
-        # response (clob-openapi.yaml SendOrderResponse) — 6-decimal fixed-point
-        # strings for USDC cost and shares received. We switched to reading these
-        # directly here instead of a separate get_order() lookup, since get_order
-        # returned None for this order type (market/FAK orders resolve instantly
-        # and likely never enter the "open orders" index get_order queries).
+        deadline = window_open_time + BUY_TIMEOUT_SEC
+        while now_unix() < deadline:
+            time.sleep(0.25)
+            try:
+                detail = self.client.get_order(order_id)
+            except Exception:
+                detail = None
+            if detail is None:
+                elapsed_ms = (now_unix() - window_open_time) * 1000
+                log(f"✅ BUY appears filled (order no longer open), order {order_id[:16]}... ({elapsed_ms:.0f}ms) "
+                    f"— price assumed at ceiling ${BUY_CEILING_PRICE}, may understate actual profit", crypto)
+                return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": size, "elapsed_ms": elapsed_ms}
+
+        from py_clob_client_v2 import OrderPayload
         try:
-            filled_cost = round(float(resp["makingAmount"]) / 1_000_000, 2)
-            filled_size = round(float(resp["takingAmount"]) / 1_000_000, 4)
-        except (KeyError, TypeError, ValueError) as e:
-            log(f"   ⚠️ Could not parse makingAmount/takingAmount ({e}), assuming full fill. Raw resp: {resp}")
-            filled_size, filled_cost = amount_usdc / price, amount_usdc
+            self.client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception as e:
+            log(f"⚠️ Cancel request failed ({e}) — order may still be resting, check manually.", crypto)
 
-        expected_size = amount_usdc / price
-        fill_pct = (filled_size / expected_size * 100) if expected_size else 0
-        log(f"   ✅ BUY OK: {status} | filled {filled_size:.2f}/{expected_size:.2f} shares ({fill_pct:.0f}%) "
-            f"| cost ${filled_cost:.2f} | order {order_id[:20]}...")
-        return filled_cost
-    except ImportError:
-        raise ImportError("Install py-clob-client-v2: pip install py-clob-client-v2")
-    except Exception as e:
-        log(f"   ❌ BUY failed: {e}")
-        return 0.0
+        elapsed_ms = (now_unix() - window_open_time) * 1000
+        log(f"❌ BUY timed out after {BUY_TIMEOUT_SEC}s, cancelled ({elapsed_ms:.0f}ms)", crypto)
+        return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
 
-# ─── BOT ───────────────────────────────────────────────────────────────────────
-class CryptoBot:
+    # ── SELL PHASE ───────────────────────────────────────────────────────────
 
-    def __init__(self, paper: bool, dry_run: bool, amount: float):
-        self.paper        = paper
-        self.dry_run      = dry_run  # real data, no execution
-        self.amount       = amount
-        self.traded_slugs = set()
-        self.momentum_track = {}  # {crypto: {"window_ts": int, "up": bool, "consecutive": int}}
-        self.trades       = []
-        self.private_key  = os.getenv("POLY_PRIVATE_KEY", "")
-        self.proxy_wallet = os.getenv("POLY_PROXY_WALLET", "")
-        self.signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "3"))
+    def _watch_for_sell(self, market: dict, buy_info: dict, window_open_time: float) -> dict:
+        """After a successful buy, watch for the UP price to reach buy_price + PROFIT_MARGIN."""
+        crypto      = market["crypto"]
+        token       = market["up_token"]
+        close_ts    = market["close_ts"]
+        buy_price   = buy_info["price"]
+        shares      = buy_info["shares"]
+        sell_trigger = round(buy_price + PROFIT_MARGIN, 4)  # relative to THIS trade's actual entry, not a fixed price
+        log(f"Sell trigger for this trade: ${sell_trigger} (bought ${buy_price} + ${PROFIT_MARGIN} margin)", crypto)
+        opportunities = 0
+        in_opportunity_zone = False
 
-        if not paper and not dry_run and (not self.private_key or not self.proxy_wallet):
-            raise ValueError("POLY_PRIVATE_KEY and POLY_PROXY_WALLET required in .env")
+        while True:
+            seconds_left = close_ts - now_unix()
+            if seconds_left <= FORCE_EXIT_SECONDS_LEFT:
+                break
 
-        mode = "DRY RUN" if dry_run else ("PAPER" if paper else "🔴 LIVE")
-        log("=" * 60)
-        log(f"Crypto Up/Down Bot | {mode} | ${amount}/trade")
-        log(f"Markets: {', '.join(MARKETS.values())}")
-        log(f"Entry window: {ENTRY_SECONDS_MIN}-{ENTRY_SECONDS_MAX}s | "
-            f"Price: BTC>={PRICE_MIN['BTC']} ETH>={PRICE_MIN['ETH']} max={PRICE_MAX}")
-        log(f"Min delta: {DELTA_SKIP*100:.3f}% | Min confidence: {MIN_CONFIDENCE*100:.0f}%")
-        log("=" * 60)
+            book = get_order_book(token)
+            price, size = best_bid(book)
+
+            if price is not None and price >= sell_trigger:
+                if not in_opportunity_zone:
+                    opportunities += 1
+                    in_opportunity_zone = True
+                    log(f"Opportunity #{opportunities}: bid ${price:.3f} (size {size}) — attempting sell", crypto)
+
+                sell_result = self._attempt_sell(token, shares, price, crypto, sell_trigger)
+                if sell_result["result"] == "sold":
+                    pnl = round((sell_result["price"] - buy_price) * shares, 4)
+                    return {**sell_result, "opportunities": opportunities, "pnl_usd": pnl,
+                            "notes": f"sold on opportunity #{opportunities}"}
+            else:
+                in_opportunity_zone = False
+
+            time.sleep(POLL_INTERVAL_SLOW)
+
+        log(f"⏰ Force-exit window reached ({FORCE_EXIT_SECONDS_LEFT}s left), still holding — exiting at best price", crypto)
+        exit_result = self._force_exit(token, shares, crypto)
+        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+        return {**exit_result, "opportunities": opportunities, "pnl_usd": pnl, "notes": "force-exit, no opportunity filled"}
+
+    def _attempt_sell(self, token: str, shares: float, observed_price: float, crypto: str, sell_trigger: float) -> dict:
+        if self.dry_run:
+            book = get_order_book(token)
+            price, size = best_bid(book)
+            if price is not None and price >= sell_trigger and size >= shares:
+                log(f"[DRY] SELL would fill: bid ${price:.3f} (sufficient depth for {shares} shares)", crypto)
+                return {"result": "sold", "price": price}
+            log(f"[DRY] SELL opportunity did not have enough depth ({size} < {shares} needed) — missed", crypto)
+            return {"result": "missed", "price": None}
+
+        from py_clob_client_v2 import OrderArgsV2, Side, OrderType
+        try:
+            resp = self.client.create_and_post_order(
+                OrderArgsV2(token_id=token, price=sell_trigger, size=shares, side=Side.SELL),
+                order_type=OrderType.FAK,
+            )
+        except Exception as e:
+            log(f"⚠️ SELL order failed: {e}", crypto)
+            return {"result": "missed", "price": None}
+
+        status = str(resp.get("status", "")).lower()
+        if status == "matched":
+            log(f"✅ SELL matched at order {resp.get('orderID','')[:16]}...", crypto)
+            return {"result": "sold", "price": observed_price}
+        return {"result": "missed", "price": None}
+
+    def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
+        """Exit at any available price — no floor, no ceiling."""
+        if self.dry_run:
+            book = get_order_book(token)
+            price, size = best_bid(book)
+            if price is None:
+                log("[DRY] No bids at all for force-exit — would be a total loss this window", crypto)
+                return {"result": "no_bids", "price": None}
+            log(f"[DRY] Force-exit would fill at ${price:.3f}", crypto)
+            return {"result": "exited", "price": price}
+
+        from py_clob_client_v2 import MarketOrderArgsV2, Side, OrderType
+        try:
+            resp = self.client.create_and_post_market_order(
+                MarketOrderArgsV2(token_id=token, amount=shares, side=Side.SELL),
+                order_type=OrderType.FAK,
+            )
+        except Exception as e:
+            log(f"⚠️ Force-exit order failed: {e}", crypto)
+            return {"result": "error", "price": None}
+
+        status = str(resp.get("status", "")).lower()
+        if status == "matched":
+            try:
+                cost = float(resp.get("makingAmount", 0)) / 1_000_000
+                exit_price = round(cost / shares, 4) if shares else None
+            except Exception:
+                exit_price = None
+            log(f"✅ Force-exit matched, order {resp.get('orderID','')[:16]}...", crypto)
+            return {"result": "exited", "price": exit_price}
+        log("⚠️ Force-exit did not match — position may still be open, check account manually", crypto)
+        return {"result": "unmatched", "price": None}
+
+    # ── WINDOW HANDLER ───────────────────────────────────────────────────────
+
+    def _handle_window(self, slug_prefix: str, start_ts: int):
+        crypto = MARKETS[slug_prefix]
+
+        while now_unix() < start_ts - 1:
+            time.sleep(0.2)
+        while now_unix() < start_ts:
+            time.sleep(0.005)
+
+        window_open_time = now_unix()
+
+        market = None
+        find_deadline = window_open_time + 3
+        while now_unix() < find_deadline:
+            market = get_window_market(slug_prefix, start_ts)
+            if market:
+                break
+            time.sleep(0.1)
+
+        if not market:
+            log(f"Could not find market for window starting {start_ts} within 3s of open — skipping this window", crypto)
+            return
+
+        buy_info = self._attempt_buy(market, window_open_time)
+
+        row = {
+            "timestamp":   ts_str(),
+            "bot_name":    self.bot_name,
+            "mode":        self.mode_str,
+            "crypto":      crypto,
+            "slug":        market["slug"],
+            "buy_result":  buy_info["result"],
+            "buy_price":   buy_info["price"],
+            "buy_shares":  buy_info["shares"],
+            "buy_elapsed_ms": round(buy_info["elapsed_ms"], 1),
+        }
+
+        if buy_info["result"] != "bought":
+            row.update({"sell_result": "n/a", "sell_price": "", "pnl_usd": 0, "notes": "no buy fill", "num_opportunities": 0})
+            self._record(row)
+            return
+
+        sell_info = self._watch_for_sell(market, buy_info, window_open_time)
+        row.update({
+            "sell_result":       sell_info["result"],
+            "sell_price":        sell_info["price"],
+            "num_opportunities": sell_info["opportunities"],
+            "pnl_usd":           sell_info["pnl_usd"],
+            "notes":             sell_info["notes"],
+        })
+        self._record(row)
+
+    def _record(self, row: dict):
+        with self.trades_lock:
+            self.trades.append(row)
+        self.logger.write(row)
+        pnl = row.get("pnl_usd", 0)
+        sign = "+" if isinstance(pnl, (int, float)) and pnl >= 0 else ""
+        log(f"RECORDED: buy={row['buy_result']}@{row['buy_price']} | sell={row['sell_result']}@{row['sell_price']} "
+            f"| opportunities={row['num_opportunities']} | pnl={sign}${pnl}", row["crypto"])
+
+    # ── ASSET LOOP ───────────────────────────────────────────────────────────
+
+    def _asset_loop(self, slug_prefix: str):
+        crypto = MARKETS[slug_prefix]
+        while not self.stop_event.is_set():
+            start_ts = next_window_start(now_unix())
+            wake_at  = start_ts - 10
+            while now_unix() < wake_at and not self.stop_event.is_set():
+                time.sleep(1)
+            if self.stop_event.is_set():
+                break
+            log(f"Waking for window starting {datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC", crypto)
+            try:
+                self._handle_window(slug_prefix, start_ts)
+            except Exception as e:
+                log(f"⚠️ Unhandled error this window: {e}", crypto)
+            time.sleep(2)
+
+    # ── RUN / SUMMARY ────────────────────────────────────────────────────────
 
     def run(self):
-        while True:
-            try:
-                self._cycle()
-            except KeyboardInterrupt:
-                log("Stopped.")
-                self._print_summary()
-                break
-            except Exception as e:
-                log(f"Error: {e}")
-                time.sleep(5)
-
-    def _cycle(self):
-        close_ts   = next_close_ts()
-        sleep_secs = close_ts - now_unix() - WAKE_BEFORE
-
-        if sleep_secs > 0:
-            log(f"💤 Sleeping {sleep_secs:.0f}s → next close "
-                f"{datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
-            time.sleep(sleep_secs)
-
-        if now_unix() >= close_ts + 5:
-            log(f"⚠️  Arrived too late, skipping close "
-                f"{datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
-            for prefix in MARKETS:
-                self.traded_slugs.add(f"{prefix}-{close_ts - 300}")
-            return
-
-        log(f"⚡ Active window — close "
-            f"{datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
-
-        entered_slugs = set()
-
-        while True:
-            seconds_left = close_ts - now_unix()
-
-            if seconds_left <= 0:
-                log("⏰ Market closed.")
-                for prefix in MARKETS:
-                    self.traded_slugs.add(f"{prefix}-{close_ts - 300}")
-                break
-
-            pending = [
-                prefix for prefix in MARKETS
-                if f"{prefix}-{close_ts - 300}" not in self.traded_slugs
-                and f"{prefix}-{close_ts - 300}" not in entered_slugs
-            ]
-
-            if not pending:
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # Query Polymarket and Binance in parallel
-            def fetch_all(prefix):
-                market = get_market_for_close(prefix, close_ts)
-                if not market:
-                    return prefix, None, None
-                clob_price = get_clob_price(market["winner_token"])
-                if clob_price > 0:
-                    market["winner_price"] = clob_price
-                # Technical analysis with Binance — correct symbol per crypto
-                w_ts = close_ts - 300
-                crypto_name = MARKETS[prefix]
-                binance_sym = BINANCE_SYMBOLS.get(crypto_name, "BTCUSDT")
-                ta = analyze(binance_sym, w_ts)
-                return prefix, market, ta
-
-            with ThreadPoolExecutor(max_workers=len(pending)) as executor:
-                futures = {executor.submit(fetch_all, p): p for p in pending}
-                results = []
-                for future in as_completed(futures):
-                    results.append(future.result())
-
-            seconds_left = close_ts - now_unix()
-
-            for prefix, market, ta in results:
-                if not market or not ta:
-                    continue
-
-                slug   = market["slug"]
-                crypto = market["crypto"]
-
-                if slug in self.traded_slugs or slug in entered_slugs:
-                    continue
-
-                # Track how many consecutive polling cycles momentum has held
-                # the same direction, resetting whenever a new 5min window starts
-                # or momentum flips. Logged for later analysis — does not affect
-                # entry decisions (yet).
-                m_up   = ta.get("momentum_up")
-                w_ts   = ta.get("window_ts")
-                prev   = self.momentum_track.get(crypto)
-                if prev is None or prev["window_ts"] != w_ts or prev["up"] != m_up:
-                    consecutive = 1
-                else:
-                    consecutive = prev["consecutive"] + 1
-                self.momentum_track[crypto] = {"window_ts": w_ts, "up": m_up, "consecutive": consecutive}
-                ta["momentum_stable_cycles"] = consecutive
-
-                # Log monitoring info when still outside entry window
-                if seconds_left > ENTRY_SECONDS_MAX + 5:
-                    log(f"   [{crypto}] {seconds_left:.0f}s | "
-                        f"PM:{market['winner_side']}@{market['winner_price']:.3f} | "
-                        f"Price:{ta.get('current_price',0):.2f} | "
-                        f"delta:{ta.get('delta_pct',0):.4f}% | "
-                        f"conf:{ta.get('confidence',0):.0%}")
-                    continue
-
-                log(f"🎯 [{crypto}] {seconds_left:.1f}s | "
-                    f"PM:{market['winner_side']}@{market['winner_price']:.3f} | "
-                    f"delta:{ta.get('delta_pct',0):.4f}% | "
-                    f"conf:{ta.get('confidence',0):.0%} | "
-                    f"mom_stable:{consecutive}x | "
-                    f"{ta.get('reason','')[:50]}")
-
-                if ENTRY_SECONDS_MIN <= seconds_left <= ENTRY_SECONDS_MAX:
-                    self._evaluate_entry(market, ta, seconds_left, entered_slugs)
-
-            time.sleep(POLL_INTERVAL)
-
-    def _evaluate_entry(self, market, ta, seconds_left, entered_slugs):
-        slug      = market["slug"]
-        crypto    = market["crypto"]
-        price_min = PRICE_MIN.get(crypto, 0.92)
-
-        # Filter 1: minimum price per crypto
-        if market["winner_price"] < price_min:
-            log(f"   [{crypto}] SKIP — PM price {market['winner_price']:.3f} < {price_min}")
-            return
-
-        # Filter 1b: maximum price
-        if market["winner_price"] > PRICE_MAX:
-            log(f'   [{crypto}] SKIP — PM price {market["winner_price"]:.3f} > {PRICE_MAX} (minimal upside)')
-            return
-
-        # Filter 2: minimum confidence
-        confidence = ta.get("confidence", 0)
-        if confidence < MIN_CONFIDENCE:
-            log(f"   [{crypto}] SKIP — confidence {confidence:.0%} < {MIN_CONFIDENCE:.0%}")
-            return
-
-        # Filter 3: direction must match between Binance and Polymarket
-        ta_dir  = ta.get("direction")
-        pm_side = market["winner_side"]
-        if ta_dir and ta_dir != pm_side:
-            log(f"   [{crypto}] SKIP — Binance says {ta_dir} but PM says {pm_side}")
-            return
-
-        # Filter 4: minimum delta
-        delta_pct = ta.get("delta_pct", 0)
-        if delta_pct < DELTA_SKIP * 100:
-            log(f"   [{crypto}] SKIP — delta {delta_pct:.4f}% too small")
-            return
-
-        self._enter(market, ta, seconds_left)
-        entered_slugs.add(slug)
-        self.traded_slugs.add(slug)
-
-    def _enter(self, market: dict, ta: dict, seconds_left: float):
-        price        = market["winner_price"]
-        expected_pnl = (self.amount / price) - self.amount
-        expected_pct = expected_pnl / self.amount * 100
-        crypto       = market["crypto"]
-
-        log(f"🟢 ENTERING [{crypto} {market['winner_side']}] {market['title'][:45]}")
-        log(f"   price={price:.3f} | time_left={seconds_left:.1f}s | "
-            f"invested=${self.amount:.2f} | expected_pnl=+${expected_pnl:.2f} (+{expected_pct:.1f}%)")
-        log(f"   Price:{ta.get('current_price',0):.2f} | "
-            f"delta:{ta.get('delta_pct',0):.4f}% | "
-            f"conf:{ta.get('confidence',0):.0%} | "
-            f"momentum_confirms:{ta.get('momentum_confirms')} | "
-            f"momentum_stable_cycles:{ta.get('momentum_stable_cycles',0)}")
-
-        if self.paper or self.dry_run:
-            mode = "📄 PAPER" if self.paper else "🔍 DRY RUN"
-            log(f"   {mode} — not executed on chain")
-            filled_amount = self.amount
-        else:
-            filled_amount = execute_buy(
-                market["winner_token"], self.amount, price,
-                self.private_key, self.proxy_wallet, self.signature_type
-            )
-
-        if filled_amount > 0:
-            actual_pnl = (filled_amount / price) - filled_amount
-            self.trades.append({
-                "crypto":       crypto,
-                "title":        market["title"],
-                "side":         market["winner_side"],
-                "price_entry":  price,
-                "amount":       filled_amount,
-                "seconds_left": seconds_left,
-                "pnl_expected": actual_pnl,
-                "delta_pct":    ta.get("delta_pct", 0),
-                "confidence":   ta.get("confidence", 0),
-                "timestamp":    ts_str(),
-            })
-            fill_note = "" if filled_amount >= self.amount * 0.99 else f" (partial: ${filled_amount:.2f} of ${self.amount:.2f})"
-            log(f"   ✅ Trade #{len(self.trades)} recorded [{crypto}]{fill_note}")
+        threads = [threading.Thread(target=self._asset_loop, args=(prefix,), daemon=True) for prefix in MARKETS]
+        for t in threads:
+            t.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            log("Stopping...")
+            self.stop_event.set()
+            self._print_summary()
 
     def _print_summary(self):
-        log("─" * 60)
-        log(f"SUMMARY — {len(self.trades)} trades")
-        total_invested = sum(t["amount"] for t in self.trades)
-        total_expected = sum(t["pnl_expected"] for t in self.trades)
-        for t in self.trades:
-            log(f"  [{t['crypto']}] {t['title'][:35]} | {t['side']} @ "
-                f"{t['price_entry']:.3f} | {t['seconds_left']:.0f}s | "
-                f"delta:{t['delta_pct']:.4f}% | conf:{t['confidence']:.0%} | "
-                f"+${t['pnl_expected']:.2f}")
-        if self.trades:
-            log(f"  Total invested: ${total_invested:.2f}")
-            log(f"  Expected PnL:   +${total_expected:.2f} "
-                f"(+{total_expected/total_invested*100:.1f}%)")
-        log("─" * 60)
+        log("-" * 70)
+        with self.trades_lock:
+            trades = list(self.trades)
+        log(f"SUMMARY — {len(trades)} windows attempted")
+        bought  = [t for t in trades if t["buy_result"] == "bought"]
+        sold    = [t for t in bought if t["sell_result"] == "sold"]
+        forced  = [t for t in bought if t["sell_result"] in ("exited", "no_bids", "unmatched")]
+        total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
+
+        log(f"  Buy fills: {len(bought)}/{len(trades)}")
+        log(f"  Sold at/above entry+${PROFIT_MARGIN} margin: {len(sold)}")
+        log(f"  Force-exited (never reached trigger): {len(forced)}")
+        log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+        log("-" * 70)
 
 
-# ─── ENTRY POINT ───────────────────────────────────────────────────────────────
+# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Crypto Up/Down 5min Bot with Window Delta")
-    parser.add_argument("--paper",    action="store_true", help="Paper trading mode (simulated)")
-    parser.add_argument("--live",     action="store_true", help="Live trading mode (real funds)")
-    parser.add_argument("--dry-run",  action="store_true", help="Dry run — real data, no trades executed")
-    parser.add_argument("--amount",   type=float, default=10.0, help="USDC per trade")
+    parser = argparse.ArgumentParser(description="Polymarket Up-Only Scalper Bot")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="Observe real order book data, place no real orders")
+    mode.add_argument("--live", action="store_true", help="Place real orders with real funds")
+    parser.add_argument("--amount", type=float, default=2.0, help="USDC stake per trade (default: $2)")
     args = parser.parse_args()
 
-    dry_run = args.dry_run
-    paper   = args.paper or (not args.live and not dry_run)
-
-    bot = CryptoBot(paper=paper, dry_run=dry_run, amount=args.amount)
+    bot = SpreadBot(dry_run=args.dry_run, amount=args.amount)
     bot.run()
