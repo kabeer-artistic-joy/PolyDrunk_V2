@@ -243,7 +243,7 @@ class SpreadBot:
                     last_seen_price = price
                 elapsed_ms = (now_unix() - window_open_time) * 1000
                 if price is not None and price <= BUY_CEILING_PRICE:
-                    MIN_SHARES = 1
+                    MIN_SHARES = 5  # CONFIRMED via a real live API error: "Size (4) lower than the minimum: 5". The earlier removal of this floor was wrong — Polymarket's own limit-order API enforces 5 as the real minimum.
                     shares = max(MIN_SHARES, round(self.amount / price))
                     actual_cost = round(shares * price, 2)
                     if actual_cost > self.amount * 1.5:
@@ -261,7 +261,7 @@ class SpreadBot:
 
         # LIVE
         from py_clob_client_v2 import OrderArgsV2, Side, OrderType
-        MIN_SHARES = 1  # NOT independently confirmed by Polymarket docs — a minimal safety floor only.
+        MIN_SHARES = 5  # CONFIRMED via a real live API error, same as above.
         size = max(MIN_SHARES, round(self.amount / BUY_CEILING_PRICE))
         actual_cost = round(size * BUY_CEILING_PRICE, 2)
         if actual_cost > self.amount * 1.5:
@@ -324,7 +324,25 @@ class SpreadBot:
         token       = market["up_token"]
         close_ts    = market["close_ts"]
         buy_price   = buy_info["price"]
-        shares      = buy_info["shares"]
+        # Floor to a whole share count before ever attempting to sell. A GTC
+        # buy can genuinely PARTIAL-FILL (less resting liquidity than
+        # requested), leaving a fractional share count like 3.7 — selling a
+        # fraction breaks the same 2-decimal maker-amount rule that whole-share
+        # sizing was built to satisfy on the buy side. This was a REAL bug: it
+        # caused every sell attempt to fail with "invalid maker amount" and
+        # required a manual sell. Flooring loses a tiny bit of value (a small
+        # unsellable dust remainder) but guarantees every sell order this bot
+        # submits is actually valid.
+        raw_shares  = buy_info["shares"]
+        shares      = int(raw_shares)
+        if shares != raw_shares:
+            log(f"⚠️ Buy partially filled: held {raw_shares} shares, flooring to {shares} whole shares to keep sells valid "
+                f"({round(raw_shares - shares, 4)} shares of dust left unsellable by this bot)", crypto)
+        if shares < 1:
+            log("⚠️ Partial fill left less than 1 whole share — nothing meaningfully sellable, forcing immediate exit attempt", crypto)
+            exit_result = self._force_exit(token, raw_shares, crypto)
+            pnl = -round(buy_price * raw_shares, 4)  # treat as a full loss on the tiny fill rather than pretend a real sell was attempted
+            return {**exit_result, "opportunities": 0, "pnl_usd": pnl, "notes": "sub-1-share partial fill, forced exit immediately"}
         sell_trigger = round(buy_price + PROFIT_MARGIN, 4)  # relative to THIS trade's actual entry, not a fixed price
         log(f"Sell trigger for this trade: ${sell_trigger} (bought ${buy_price} + ${PROFIT_MARGIN} margin)", crypto)
         opportunities = 0
