@@ -1,9 +1,15 @@
 """
-crypto_bot.py — ETH/BTC Up/Down 5min Trading Bot with Window Delta
+crypto_bot.py — ETH Up/Down 5min Trading Bot with Window Delta
 Strategy:
   - Calculates Window Delta (current ETH price vs period-open price) from Binance
   - Only enters if the delta is large enough (near-certain outcome)
   - Enters between 10–50 seconds before close when Polymarket price >= 0.92
+
+BTC removed per explicit decision: both real losses this bot has had occurred
+on BTC, and the best profits have come from ETH. This is a real, legitimate
+pattern worth acting on — though worth remembering it's based on a small
+sample (2 losses), so it's a reasonable bet on the pattern holding, not a
+statistically proven fact about BTC being structurally different.
 
 Improvements over previous version:
   - Binance Window Delta as primary filter (avoids entering near the line)
@@ -36,8 +42,7 @@ BINANCE_API       = "https://api.binance.com"
 
 ENTRY_SECONDS_MAX = 50
 ENTRY_SECONDS_MIN = 10
-PRICE_MIN         = {          # minimum price per crypto — BTC stricter due to higher volatility
-    "BTC": 0.94,
+PRICE_MIN         = {          # minimum price per crypto
     "ETH": 0.92,
 }
 PRICE_MAX         = 0.99   # maximum price — CLOB accepts up to 0.99
@@ -62,12 +67,10 @@ ATR_MULTIPLIER    = 1.5   # if current range > 1.5x ATR → skip
 
 # Binance symbols
 BINANCE_SYMBOLS = {
-    "BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
 }
 
 MARKETS = {
-    "btc-updown-5m": "BTC",
     "eth-updown-5m": "ETH",
 }
 
@@ -434,7 +437,7 @@ class CryptoBot:
         log(f"Crypto Up/Down Bot | {mode} | ${amount}/trade")
         log(f"Markets: {', '.join(MARKETS.values())}")
         log(f"Entry window: {ENTRY_SECONDS_MIN}-{ENTRY_SECONDS_MAX}s | "
-            f"Price: BTC>={PRICE_MIN['BTC']} ETH>={PRICE_MIN['ETH']} max={PRICE_MAX}")
+            f"Price: ETH>={PRICE_MIN['ETH']} max={PRICE_MAX}")
         log(f"Min delta: {DELTA_SKIP*100:.3f}% | Min confidence: {MIN_CONFIDENCE*100:.0f}%")
         log("=" * 60)
 
@@ -501,7 +504,7 @@ class CryptoBot:
                 # Technical analysis with Binance — correct symbol per crypto
                 w_ts = close_ts - 300
                 crypto_name = MARKETS[prefix]
-                binance_sym = BINANCE_SYMBOLS.get(crypto_name, "BTCUSDT")
+                binance_sym = BINANCE_SYMBOLS.get(crypto_name, "ETHUSDT")
                 ta = analyze(binance_sym, w_ts)
                 return prefix, market, ta
 
